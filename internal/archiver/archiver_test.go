@@ -1,6 +1,7 @@
 package archiver
 
 import (
+	"bytes"
 	"context"
 	"io/ioutil"
 	"os"
@@ -124,9 +125,9 @@ func saveFile(t testing.TB, repo restic.Repository, filename string, filesystem 
 
 func TestArchiverSaveFile(t *testing.T) {
 	var tests = []TestFile{
-		TestFile{Content: ""},
-		TestFile{Content: "foo"},
-		TestFile{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
+		{Content: ""},
+		{Content: "foo"},
+		{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
 	}
 
 	for _, testfile := range tests {
@@ -202,9 +203,9 @@ func TestArchiverSaveFileReaderFS(t *testing.T) {
 
 func TestArchiverSave(t *testing.T) {
 	var tests = []TestFile{
-		TestFile{Content: ""},
-		TestFile{Content: "foo"},
-		TestFile{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
+		{Content: ""},
+		{Content: "foo"},
+		{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
 	}
 
 	for _, testfile := range tests {
@@ -574,6 +575,19 @@ func TestFileChanged(t *testing.T) {
 			Modify: func(t testing.TB, filename string) {
 				sleep()
 				save(t, filename, defaultContent)
+			},
+		},
+		{
+			Name: "new-content-same-timestamp",
+			Modify: func(t testing.TB, filename string) {
+				fi, err := os.Stat(filename)
+				if err != nil {
+					t.Fatal(err)
+				}
+				extFI := fs.ExtendedStat(fi)
+				save(t, filename, bytes.ToUpper(defaultContent))
+				sleep()
+				setTimestamp(t, filename, extFI.AccessTime, extFI.ModTime)
 			},
 		},
 		{
@@ -1915,4 +1929,94 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func snapshot(t testing.TB, repo restic.Repository, fs fs.FS, parent restic.ID, filename string) (restic.ID, *restic.Node) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	arch := New(repo, fs, Options{})
+
+	sopts := SnapshotOptions{
+		Time:           time.Now(),
+		ParentSnapshot: parent,
+	}
+	snapshot, snapshotID, err := arch.Snapshot(ctx, []string{filename}, sopts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := repo.LoadTree(ctx, *snapshot.Tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node := tree.Find(filename)
+	if node == nil {
+		t.Fatalf("unable to find node for testfile in snapshot")
+	}
+
+	return snapshotID, node
+}
+
+func chmod(t testing.TB, filename string, mode os.FileMode) {
+	err := os.Chmod(filename, mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// StatFS allows overwriting what is returned by the Lstat function.
+type StatFS struct {
+	fs.FS
+
+	OverrideLstat map[string]os.FileInfo
+}
+
+func (fs *StatFS) Lstat(name string) (os.FileInfo, error) {
+	if fi, ok := fs.OverrideLstat[name]; ok {
+		return fi, nil
+	}
+
+	return fs.FS.Lstat(name)
+}
+
+func (fs *StatFS) OpenFile(name string, flags int, perm os.FileMode) (fs.File, error) {
+	if fi, ok := fs.OverrideLstat[name]; ok {
+		f, err := fs.FS.OpenFile(name, flags, perm)
+		if err != nil {
+			return nil, err
+		}
+
+		wrappedFile := fileStat{
+			File: f,
+			fi:   fi,
+		}
+		return wrappedFile, nil
+	}
+
+	return fs.FS.OpenFile(name, flags, perm)
+}
+
+type fileStat struct {
+	fs.File
+	fi os.FileInfo
+}
+
+func (f fileStat) Stat() (os.FileInfo, error) {
+	return f.fi, nil
+}
+
+type wrappedFileInfo struct {
+	os.FileInfo
+	sys  interface{}
+	mode os.FileMode
+}
+
+func (fi wrappedFileInfo) Sys() interface{} {
+	return fi.sys
+}
+
+func (fi wrappedFileInfo) Mode() os.FileMode {
+	return fi.mode
 }
